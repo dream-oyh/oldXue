@@ -1,0 +1,741 @@
+"""
+主应用：Win32 消息循环 + 托盘图标 + 热键 + 全流程编排。
+
+线程模型：
+  主线程  ─ Win32 消息循环（隐藏窗口 + 托盘 + 热键）
+  辅助线程 ─ tkinter 设置窗口（按需启动）
+  辅助线程 ─ STT API 调用（每次 PTT 松键后）
+"""
+
+import asyncio
+import ctypes
+import json
+import os
+import sys
+import threading
+import time
+from ctypes import wintypes
+from pathlib import Path
+
+# 自定义消息
+WM_APP_UPDATE_HOTKEY = 0x8001     # 更新热键
+WM_APP_OPEN_SETTINGS = 0x8002     # 打开设置窗口
+WM_APP_TRAY_CALLBACK = 0x8003     # 托盘图标回调（系统定义，但用固定 ID）
+
+# 托盘
+WM_TRAYICON = 0x8004              # 托盘通知消息
+ID_TRAY = 1
+IDM_SETTINGS = 1001
+IDM_EXIT = 1002
+IDM_RESTART_ADMIN = 1003
+
+# 热键
+ID_HOTKEY = 1
+IDT_POLL_KEY = 1                  # 松键轮询定时器 ID
+
+# ---------------------------------------------------------------------------
+# Win32 常量 / 结构体
+# ---------------------------------------------------------------------------
+
+# 窗口
+WS_OVERLAPPEDWINDOW = 0x00CF0000
+WS_EX_TOOLWINDOW = 0x00000080
+CW_USEDEFAULT = 0x80000000
+
+# 消息
+WM_HOTKEY = 0x0312
+WM_CLOSE = 0x0010
+WM_DESTROY = 0x0002
+WM_TIMER = 0x0113
+WM_COMMAND = 0x0111
+WM_USER = 0x0400
+
+# 托盘
+NIM_ADD = 0
+NIM_MODIFY = 1
+NIM_DELETE = 2
+NIF_MESSAGE = 1
+NIF_ICON = 2
+NIF_TIP = 4
+NIF_INFO = 0x10
+NIIF_INFO = 1
+NIIF_ERROR = 3
+WM_LBUTTONUP = 0x0202
+WM_RBUTTONUP = 0x0205
+
+# 窗口扩展样式
+GWL_EXSTYLE = -20
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_APPWINDOW = 0x00040000
+
+# 窗口消息框
+TPM_LEFTALIGN = 0
+TPM_RIGHTBUTTON = 2
+
+# ── 设置 Win32 API 参数类型（64 位兼容，ALL functions）──
+_udll = ctypes.windll.user32
+_kdll = ctypes.windll.kernel32
+_sdll = ctypes.windll.shell32
+
+_udll.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_udll.DefWindowProcW.restype = wintypes.LPARAM
+_udll.RegisterClassExW.argtypes = [ctypes.c_void_p]
+_udll.RegisterClassExW.restype = wintypes.ATOM
+_udll.CreateWindowExW.argtypes = [
+    wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+]
+_udll.CreateWindowExW.restype = wintypes.HWND
+_udll.GetMessageW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.UINT]
+_udll.GetMessageW.restype = wintypes.BOOL
+_udll.TranslateMessage.argtypes = [ctypes.c_void_p]
+_udll.DispatchMessageW.argtypes = [ctypes.c_void_p]
+_udll.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+_udll.PostMessageW.restype = wintypes.BOOL
+_udll.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+_udll.RegisterHotKey.restype = wintypes.BOOL
+_udll.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+_udll.UnregisterHotKey.restype = wintypes.BOOL
+_udll.GetAsyncKeyState.argtypes = [ctypes.c_int]
+_udll.GetAsyncKeyState.restype = wintypes.SHORT
+_udll.SetTimer.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.UINT, ctypes.c_void_p]
+_udll.KillTimer.argtypes = [wintypes.HWND, wintypes.UINT]
+_udll.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+_udll.FindWindowW.restype = wintypes.HWND
+_udll.CreatePopupMenu.argtypes = []
+_udll.CreatePopupMenu.restype = wintypes.HMENU
+_udll.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, wintypes.UINT, wintypes.LPCWSTR]
+_udll.GetCursorPos.argtypes = [ctypes.c_void_p]
+_udll.SetForegroundWindow.argtypes = [wintypes.HWND]
+_udll.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND, ctypes.c_void_p]
+_udll.DestroyMenu.argtypes = [wintypes.HMENU]
+_udll.DestroyWindow.argtypes = [wintypes.HWND]
+_udll.PostQuitMessage.argtypes = [ctypes.c_int]
+_udll.CreateIconFromResourceEx.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+_udll.CreateIconFromResourceEx.restype = wintypes.HICON
+_udll.DestroyIcon.argtypes = [wintypes.HICON]
+_udll.MessageBeep.argtypes = [wintypes.UINT]
+_kdll.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+_kdll.CreateMutexW.restype = wintypes.HANDLE
+_kdll.CloseHandle.argtypes = [wintypes.HANDLE]
+_kdll.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+_kdll.GetModuleHandleW.restype = wintypes.HINSTANCE
+_sdll.ShellExecuteW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.c_int]
+_sdll.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.c_void_p]
+
+# Hotkey modifiers
+MOD_ALT = 0x0001
+MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
+
+# ---------------------------------------------------------------------------
+# 结构体定义
+# ---------------------------------------------------------------------------
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("message", wintypes.UINT),
+        ("wParam", wintypes.WPARAM),
+        ("lParam", wintypes.LPARAM),
+        ("time", wintypes.DWORD),
+        ("pt", POINT),
+    ]
+
+
+class WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT),
+        ("style", wintypes.UINT),
+        ("lpfnWndProc", ctypes.c_void_p),
+        ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int),
+        ("hInstance", wintypes.HINSTANCE),
+        ("hIcon", wintypes.HICON),
+        ("hCursor", wintypes.HICON),
+        ("hbrBackground", wintypes.HBRUSH),
+        ("lpszMenuName", wintypes.LPCWSTR),
+        ("lpszClassName", wintypes.LPCWSTR),
+        ("hIconSm", wintypes.HICON),
+    ]
+
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uID", wintypes.UINT),
+        ("uFlags", wintypes.UINT),
+        ("uCallbackMessage", wintypes.UINT),
+        ("hIcon", wintypes.HICON),
+        ("szTip", wintypes.WCHAR * 128),
+        ("dwState", wintypes.DWORD),
+        ("dwStateMask", wintypes.DWORD),
+        ("szInfo", wintypes.WCHAR * 256),
+        ("uTimeoutOrVersion", wintypes.UINT),
+        ("szInfoTitle", wintypes.WCHAR * 64),
+        ("dwInfoFlags", wintypes.DWORD),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 窗口过程（全局回调）
+# ---------------------------------------------------------------------------
+
+# 函数指针类型
+WNDPROC_TYPE = ctypes.WINFUNCTYPE(
+    ctypes.c_longlong, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+)
+
+# 全局引用，防止被 GC
+_wndproc_ref = None
+_app_instance = None  # VoiceTypingApp 实例引用
+
+
+@WNDPROC_TYPE
+def _wnd_proc(hwnd, msg, wparam, lparam):
+    """隐藏窗口的窗口过程。"""
+    app = _app_instance
+    if app is None:
+        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+    if msg == WM_HOTKEY:
+        app._on_hotkey_press()
+        return 0
+
+    elif msg == WM_TIMER:
+        if wparam == IDT_POLL_KEY:
+            app._poll_key_release()
+        return 0
+
+    elif msg == WM_TRAYICON:
+        if lparam == WM_LBUTTONUP:
+            pass  # 左键单击托盘：可扩展
+        elif lparam == WM_RBUTTONUP:
+            app._show_tray_menu()
+        return 0
+
+    elif msg == WM_COMMAND:
+        cmd = wparam & 0xFFFF
+        if cmd == IDM_SETTINGS:
+            app._open_settings_window()
+        elif cmd == IDM_EXIT:
+            app._quit()
+        elif cmd == IDM_RESTART_ADMIN:
+            app._restart_as_admin()
+        return 0
+
+    elif msg == WM_APP_UPDATE_HOTKEY:
+        app._reload_hotkey()
+        return 0
+
+    elif msg == WM_APP_OPEN_SETTINGS:
+        app._open_settings_window()
+        return 0
+
+    elif msg == WM_CLOSE:
+        app._on_close()
+        return 0
+
+    elif msg == WM_DESTROY:
+        ctypes.windll.user32.PostQuitMessage(0)
+        return 0
+
+    return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+
+# ---------------------------------------------------------------------------
+# VoiceTypingApp
+# ---------------------------------------------------------------------------
+
+class VoiceTypingApp:
+    """主应用：消息循环 + 托盘 + 业务流程。"""
+
+    def __init__(self):
+        global _app_instance
+        _app_instance = self
+
+        from . import config
+
+        self.config = config.load_config()
+        self.hwnd: int = 0
+        self.hicon_green: int = 0
+        self.hicon_gray: int = 0
+        self.hicon_red: int = 0
+        self.hicon_current: int = 0
+
+        # 录音状态
+        self._recording = False
+        self._session = None
+        self._hotkey_vk = 0
+
+        # 互斥体
+        self._mutex = None
+
+    # ═══════════════════════════════════════════════════════════════
+    # 入口
+    # ═══════════════════════════════════════════════════════════════
+
+    def run(self):
+        """启动应用。"""
+        # 多实例保护
+        if not self._acquire_mutex():
+            if self._activate_existing():
+                return
+            # 残留互斥体已清理，重新获取
+            if not self._acquire_mutex():
+                print("无法启动：互斥体冲突")
+                return
+
+        # 检查是否已配置
+        from .config import is_configured
+
+        if not is_configured():
+            self._open_settings_window_sync()  # 首次启动，阻塞等配置完成
+            from .config import load_config
+
+            self.config = load_config()
+            if not is_configured():
+                # 用户关闭了设置窗口没保存
+                return
+
+        # 加载图标
+        self._load_icons()
+
+        # 启动 Win32 消息循环（阻塞于此）
+        self._message_loop()
+
+    # ═══════════════════════════════════════════════════════════════
+    # 互斥体
+    # ═══════════════════════════════════════════════════════════════
+
+    def _acquire_mutex(self) -> bool:
+        """创建命名互斥体，防止多实例。返回 True 表示是第一个实例。"""
+        self._mutex = ctypes.windll.kernel32.CreateMutexW(None, False,
+                                                          "VoiceTypingApp_SingleInstance")
+        return ctypes.windll.kernel32.GetLastError() != 183  # ERROR_ALREADY_EXISTS
+
+    def _activate_existing(self):
+        """通知已有实例，或残留互斥体时强制启动。"""
+        hwnd = ctypes.windll.user32.FindWindowW("VoiceTypingClass", None)
+        if hwnd:
+            ctypes.windll.user32.PostMessageW(hwnd, WM_APP_OPEN_SETTINGS, 0, 0)
+            print("薛氏语音助手已在运行中")
+            return True
+        else:
+            # 互斥体还在但找不到窗口 → 残留，关闭旧互斥体重来
+            if self._mutex:
+                ctypes.windll.kernel32.CloseHandle(self._mutex)
+                self._mutex = None
+            return False
+
+    # ═══════════════════════════════════════════════════════════════
+    # 图标加载
+    # ═══════════════════════════════════════════════════════════════
+
+    def _load_icons(self):
+        from .feedback import load_icon
+
+        self.hicon_gray = load_icon("gray")
+        self.hicon_green = load_icon("green")
+        self.hicon_red = load_icon("red")
+        self.hicon_current = self.hicon_green
+
+    def _set_icon(self, color: str):
+        """切换托盘图标颜色。"""
+        mapping = {"green": self.hicon_green, "red": self.hicon_red,
+                   "gray": self.hicon_gray}
+        hicon = mapping.get(color, self.hicon_green)
+        if hicon:
+            self.hicon_current = hicon
+            self._modify_tray()
+
+    # ═══════════════════════════════════════════════════════════════
+    # Win32 消息循环
+    # ═══════════════════════════════════════════════════════════════
+
+    def _message_loop(self):
+        """注册窗口类、创建隐藏窗口、进入消息循环。"""
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        hinstance = kernel32.GetModuleHandleW(None)
+
+        # 注册窗口类
+        global _wndproc_ref
+        _wndproc_ref = _wnd_proc  # 保持引用
+        wc = WNDCLASSEXW()
+        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
+        wc.lpfnWndProc = ctypes.cast(_wndproc_ref, ctypes.c_void_p)
+        wc.hInstance = hinstance
+        wc.lpszClassName = "VoiceTypingClass"
+        atom = user32.RegisterClassExW(ctypes.byref(wc))
+        if not atom:
+            raise OSError("RegisterClassExW 失败")
+
+        # 创建隐藏窗口
+        self.hwnd = user32.CreateWindowExW(
+            WS_EX_TOOLWINDOW,                        # 不在任务栏显示
+            "VoiceTypingClass",
+            "薛氏语音助手",
+            WS_OVERLAPPEDWINDOW,
+            CW_USEDEFAULT, CW_USEDEFAULT, 200, 200,
+            None, None, hinstance, None,
+        )
+        if not self.hwnd:
+            raise OSError("CreateWindowExW 失败")
+
+        # 添加托盘图标
+        self._add_tray()
+
+        # 注册热键
+        self._register_hotkey()
+
+        # 启动通知：告知用户当前快捷键
+        hotkey = self.config.get("hotkey", "未设置")
+        self._tray_balloon(
+            "薛氏语音助手已就绪",
+            f"按住 {hotkey} 说话，松手自动输入文字",
+        )
+
+        # 消息循环
+        msg = MSG()
+        while True:
+            ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if ret <= 0:
+                break
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+
+        # 清理
+        self._remove_tray()
+
+    def _on_close(self):
+        """WM_CLOSE 处理。"""
+        # 注销热键
+        ctypes.windll.user32.UnregisterHotKey(self.hwnd, ID_HOTKEY)
+        # 销毁窗口 → 触发 WM_DESTROY → PostQuitMessage
+        ctypes.windll.user32.DestroyWindow(self.hwnd)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 热键
+    # ═══════════════════════════════════════════════════════════════
+
+    def _register_hotkey(self):
+        """注册全局热键。"""
+        modifiers = self.config.get("hotkey_modifiers", 6)
+        vk = self.config.get("hotkey_vk", 0x56)
+        if not vk:
+            return
+
+        result = ctypes.windll.user32.RegisterHotKey(self.hwnd, ID_HOTKEY, modifiers, vk)
+        if not result:
+            # 注册失败（可能被占用），托盘显示警告
+            self._tray_balloon("快捷键注册失败", "请检查是否被其他应用占用", is_error=True)
+            self._set_icon("red")
+        else:
+            self._hotkey_vk = vk
+            self._set_icon("green")
+
+    def _reload_hotkey(self):
+        """重新加载热键（设置变更后）。"""
+        from .config import load_config
+
+        self.config = load_config()
+        ctypes.windll.user32.UnregisterHotKey(self.hwnd, ID_HOTKEY)
+        self._register_hotkey()
+
+        # 更新托盘 Tooltip + 通知用户新快捷键
+        self._update_tray_tip()
+        hotkey = self.config.get("hotkey", "未设置")
+        self._tray_balloon(
+            "快捷键已更新",
+            f"按住 {hotkey} 说话，松手自动输入文字",
+        )
+
+    def _on_hotkey_press(self):
+        """热键按下回调。"""
+        if self._recording:
+            return  # 防重复触发
+        self._recording = True
+
+        self._set_icon("green")
+
+        try:
+            from .capture import CaptureSession
+            noise_gate = self.config.get("noise_gate_threshold", -40.0)
+            self._session = CaptureSession(noise_gate_threshold=noise_gate)
+            self._session.start()
+        except Exception as e:
+            self._recording = False
+            self._show_error(f"麦克风启动失败: {e}")
+            return
+
+        ctypes.windll.user32.SetTimer(self.hwnd, IDT_POLL_KEY, 20, None)
+
+    def _poll_key_release(self):
+        """轮询热键是否松开。"""
+        if not self._recording:
+            ctypes.windll.user32.KillTimer(self.hwnd, IDT_POLL_KEY)
+            return
+
+        state = ctypes.windll.user32.GetAsyncKeyState(self._hotkey_vk)
+        if state & 0x8000:
+            return
+
+        # 松键！
+        ctypes.windll.user32.KillTimer(self.hwnd, IDT_POLL_KEY)
+        self._recording = False
+        self._set_icon("green")
+
+        # 停止录音 + 处理（异常保护：ctypes 回调吞异常，必须自行捕获）
+        segments = []
+        session = self._session
+        frame_count = session.frame_count if session else 0
+        dur = session.duration if session else 0.0
+        self._session = None
+
+        try:
+            if session:
+                segments = session.stop()
+        except Exception as e:
+            self._show_error(f"语音处理失败: {e}")
+            return
+
+        if not segments:
+            return
+
+        threading.Thread(target=self._process_segments, args=(segments,),
+                         daemon=True).start()
+
+    def _process_segments(self, segments: list[bytes]):
+        """在后台线程中调 STT API + 粘贴。"""
+        from .stt import SttClient, IatError
+
+        app_id = self.config.get("app_id", "")
+        api_key = self.config.get("api_key", "")
+        api_secret = self.config.get("api_secret", "")
+
+        client = SttClient(app_id, api_key, api_secret)
+        results = []
+
+        for i, segment in enumerate(segments):
+            try:
+                text = asyncio.run(client.transcribe(segment))
+                if text:
+                    results.append(text)
+            except IatError as e:
+                self._show_error(f"识别失败: {e.message}")
+                return
+            except Exception as e:
+                self._show_error(f"网络错误: {e}")
+                return
+
+        if results:
+            # 多段拼接：若前段末尾没有标点则补逗号
+            parts = []
+            for i, t in enumerate(results):
+                if i > 0 and t and parts[-1] and parts[-1][-1] not in "。！？，、；：.!?,;:":
+                    parts[-1] += "，"
+                parts.append(t)
+            full_text = "".join(parts)
+            self._output_text(full_text)
+            self._update_usage()
+
+    def _output_text(self, text: str):
+        """输出文字到光标位置。"""
+        from .typing_output import paste_text
+
+        paste_text(text)
+
+    def _update_usage(self):
+        """更新本地用量计数。"""
+        from .config import save_config, load_config
+
+        config = load_config()
+        now = time.strftime("%Y-%m")
+        reset_date = config.get("usage_reset_date", "")
+        if reset_date != now:
+            config["usage_count"] = 1
+            config["usage_reset_date"] = now
+        else:
+            config["usage_count"] = config.get("usage_count", 0) + 1
+        save_config(config)
+        self.config = config
+        self._update_tray_tip()
+
+    def _show_error(self, message: str):
+        """显示错误反馈。"""
+        from .feedback import beep_error
+
+        beep_error()
+        self._tray_balloon("薛氏语音助手", message, is_error=True)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 托盘图标
+    # ═══════════════════════════════════════════════════════════════
+
+    def _add_tray(self):
+        """添加托盘图标。"""
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = self.hwnd
+        nid.uID = ID_TRAY
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        nid.uCallbackMessage = WM_TRAYICON
+        nid.hIcon = self.hicon_current
+
+        tip = self._make_tip_text()
+        nid.szTip = tip
+
+        ctypes.windll.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
+
+    def _modify_tray(self):
+        """更新托盘图标。"""
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = self.hwnd
+        nid.uID = ID_TRAY
+        nid.uFlags = NIF_ICON
+        nid.hIcon = self.hicon_current
+        ctypes.windll.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+
+    def _remove_tray(self):
+        """删除托盘图标。"""
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = self.hwnd
+        nid.uID = ID_TRAY
+        ctypes.windll.shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+
+    def _update_tray_tip(self):
+        """更新托盘 Tooltip。"""
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = self.hwnd
+        nid.uID = ID_TRAY
+        nid.uFlags = NIF_TIP
+        nid.szTip = self._make_tip_text()
+        ctypes.windll.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+
+    def _make_tip_text(self) -> str:
+        hotkey = self.config.get("hotkey", "未设置")
+        count = self.config.get("usage_count", 0)
+        return f"薛氏语音助手 | {hotkey} | 本月 {count} 次"
+
+    def _tray_balloon(self, title: str, text: str, is_error: bool = False):
+        """弹出托盘气泡通知。"""
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = self.hwnd
+        nid.uID = ID_TRAY
+        nid.uFlags = NIF_INFO
+        nid.szInfoTitle = title
+        nid.szInfo = text
+        nid.dwInfoFlags = NIIF_ERROR if is_error else NIIF_INFO
+        nid.uTimeoutOrVersion = 5000  # ms
+        ctypes.windll.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+
+    # ═══════════════════════════════════════════════════════════════
+    # 托盘右键菜单
+    # ═══════════════════════════════════════════════════════════════
+
+    def _show_tray_menu(self):
+        """弹出托盘右键菜单。"""
+        user32 = ctypes.windll.user32
+
+        menu = user32.CreatePopupMenu()
+        user32.AppendMenuW(menu, 0x0000, IDM_SETTINGS, "设置")
+        user32.AppendMenuW(menu, 0x0800, 0, "")  # 分隔线
+        user32.AppendMenuW(menu, 0x0000, IDM_RESTART_ADMIN, "以管理员身份重启")
+        user32.AppendMenuW(menu, 0x0800, 0, "")  # 分隔线
+        user32.AppendMenuW(menu, 0x0000, IDM_EXIT, "退出")
+
+        # 获取光标位置
+        pt = POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+
+        # 设置前台窗口（确保菜单点击后正确消失）
+        user32.SetForegroundWindow(self.hwnd)
+
+        # 弹出菜单
+        user32.TrackPopupMenu(
+            menu,
+            TPM_LEFTALIGN | TPM_RIGHTBUTTON,
+            pt.x, pt.y,
+            0, self.hwnd, None,
+        )
+
+        user32.DestroyMenu(menu)
+
+    # ═══════════════════════════════════════════════════════════════
+    # 设置窗口
+    # ═══════════════════════════════════════════════════════════════
+
+    def _open_settings_window_sync(self):
+        """同步打开设置窗口（首次启动时阻塞）。"""
+        from .config import SettingsWindow
+
+        def _on_saved(config: dict):
+            """设置保存后通知 Win32 线程。"""
+            self.config = config
+            if self.hwnd:
+                ctypes.windll.user32.PostMessageW(self.hwnd, WM_APP_UPDATE_HOTKEY, 0, 0)
+
+        SettingsWindow(on_save_callback=_on_saved).run()
+
+    def _open_settings_window(self):
+        """异步打开设置窗口（托盘菜单触发，不阻塞消息循环）。"""
+        def _run():
+            self._open_settings_window_sync()
+        threading.Thread(target=_run, daemon=True).start()
+
+    # ═══════════════════════════════════════════════════════════════
+    # 以管理员身份重启
+    # ═══════════════════════════════════════════════════════════════
+
+    def _restart_as_admin(self):
+        """用 ShellExecute + runas 触发 UAC，以管理员权限重启自身。"""
+        import sys
+
+        # 释放互斥体，让新实例能获取
+        if self._mutex:
+            ctypes.windll.kernel32.CloseHandle(self._mutex)
+            self._mutex = None
+
+        # 删除托盘图标
+        self._remove_tray()
+
+        # 确定可执行文件路径
+        if getattr(sys, "frozen", False):
+            exe_path = sys.executable
+        else:
+            # 开发模式：用 python 解释器
+            exe_path = sys.executable
+
+        # ShellExecute runas → 弹 UAC → 用户确认 → 新进程以管理员启动
+        ctypes.windll.shell32.ShellExecuteW(
+            None,                      # hwnd
+            "runas",                   # 触发 UAC 提权
+            exe_path,                  # 目标可执行文件
+            "-m voice_typing" if not getattr(sys, "frozen", False) else "",
+            None,                      # 工作目录（默认当前目录）
+            1,                         # SW_SHOWNORMAL
+        )
+
+        # 退出当前进程
+        self._quit()
+
+    # ═══════════════════════════════════════════════════════════════
+    # 退出
+    # ═══════════════════════════════════════════════════════════════
+
+    def _quit(self):
+        """退出应用。"""
+        ctypes.windll.user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
