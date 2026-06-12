@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)]()
 
-> **开源 & 反馈** — 本项目完全开源（MIT），欢迎在 [Issues](https://github.com/Cavefrank/15/issues) 讨论问题或提出建议，也可直接邮件联系：xueyichao2000@163.com
+> **开源 & 反馈** — 本项目完全开源（MIT），欢迎在 [Issues](https://github.com/Cavefrank/oldXue/issues) 讨论问题或提出建议，也可直接邮件联系：xueyichao2000@163.com
 
 ---
 
