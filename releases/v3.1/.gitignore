@@ -1,0 +1,32 @@
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / Claude
+.vscode/
+.idea/
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# User config (contains API keys)
+*.json.bak
+
+# Test recordings
+*.wav.bak
+
+# Model files (too large, downloaded separately)
+asr-test/models/SenseVoiceSmall/
+asr-test/models/models--Systran--*/
+
+# Logo source
+logo_clean.png
+微信图片_*

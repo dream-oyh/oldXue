@@ -9,7 +9,6 @@
 
 import asyncio
 import ctypes
-import json
 import os
 import sys
 import threading
